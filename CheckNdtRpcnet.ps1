@@ -38,6 +38,9 @@ param(
     [switch]$SkipZip,
     [switch]$VerboseLog,
     [int]$NetworkTimeout = 10,
+    [switch]$DisableCertValidation,
+    [int]$PingTimeout = 5,
+    [int]$TraceRouteTimeout = 15,
     [string[]]$EndpointsToCheck = @(
     "http://search.namequery.com",
     "https://search.namequery.com/ctes/1.0.0/configuration", 
@@ -54,6 +57,26 @@ param(
 },
     [string]$OutputDirectory = $PSScriptRoot
 )
+
+# Configure TLS and certificate validation
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
+if ($DisableCertValidation) {
+    Write-Verbose "Certificate validation disabled for this session"
+    if (-not ("dummy" -as [type])) {
+        Add-Type -TypeDefinition @"
+            using System.Net;
+            using System.Security.Cryptography.X509Certificates;
+            public static class Dummy {
+                public static bool ReturnTrue(object sender,
+                    X509Certificate certificate,
+                    X509Chain chain,
+                    SslPolicyErrors sslPolicyErrors) { return true; }
+            }
+"@
+    }
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [dummy]::ReturnTrue
+}
 
 try {
     $currentPolicy = Get-ExecutionPolicy -Scope Process
@@ -201,7 +224,15 @@ function Get-SystemInfo {
                 Expression={$_.Name}
             }, @{
                 Name='Value';
-                Expression={$computerInfo.($_.Name)}
+                Expression={
+                    $value = $computerInfo.($_.Name)
+                    if ($_.Name -match 'Memory|PhysicalMemory') {
+                        $bytes = [math]::Round($value / 1GB, 2)
+                        "$bytes GB"
+                    } else {
+                        $value
+                    }
+                }
             }
 
         # Extended information
@@ -340,7 +371,8 @@ function Invoke-AbtPSDiagnostics {
 function Test-NetworkConnectivity {
     param (
         [string]$Endpoint,
-        [int]$Timeout = 5
+        [int]$PingTimeout = 5,
+        [int]$TraceRouteTimeout = 15
     )
 
     try {
@@ -348,14 +380,22 @@ function Test-NetworkConnectivity {
         $uri = [System.Uri]$Endpoint
         $hostname = $uri.Host
 
-        # Run ping test
-        $pingResult = Test-Connection -ComputerName $hostname -Count 2 -Quiet
+        # Create ping options with timeout
+        $pingOptions = New-Object System.Net.NetworkInformation.PingOptions
+        $pingOptions.DontFragment = $true
 
-        # Run traceroute (limited to 15 hops for performance)
+        # Run ping test with timeout
+        $ping = New-Object System.Net.NetworkInformation.Ping
+        $pingResult = $ping.Send($hostname, $PingTimeout * 1000)
+        $pingSuccess = $pingResult.Status -eq 'Success'
+
+        # Run traceroute with timeout
         $traceOutput = @()
         try {
             $traceRoute = Test-NetConnection -ComputerName $hostname -TraceRoute -Hops 15 -WarningAction SilentlyContinue
-            $traceOutput = $traceRoute.TraceRoute
+            if ($traceRoute.TraceRoute) {
+                $traceOutput = $traceRoute.TraceRoute
+            }
         }
         catch {
             $traceOutput = @("Traceroute failed: $($_.Exception.Message)")
@@ -363,7 +403,8 @@ function Test-NetworkConnectivity {
 
         return @{
             Host = $hostname
-            PingSuccessful = $pingResult
+            PingSuccessful = $pingSuccess
+            PingTime = if ($pingSuccess) { $pingResult.RoundtripTime } else { 0 }
             TraceRoute = $traceOutput
         }
     }
@@ -371,6 +412,7 @@ function Test-NetworkConnectivity {
         return @{
             Host = "Unknown"
             PingSuccessful = $false
+            PingTime = 0
             TraceRoute = @("Error: $($_.Exception.Message)")
         }
     }
@@ -392,23 +434,39 @@ function Test-NetworkEndpoints {
             Write-ProgressHelper -Status "Testing $endpoint"
             
             try {
-                $request = [System.Net.WebRequest]::Create($endpoint)
-                $request.Method = "GET"
-                $request.Timeout = $Timeout * 1000
-                $request.AllowAutoRedirect = $false # Match curl behavior for redirects
-                
+                # Get ping and traceroute results first
+                $pingCheck = Test-NetworkConnectivity -Endpoint $endpoint -Timeout $Timeout
+
+                # Create stopwatch for timing
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+
                 try {
+                    # Create and configure the request
+                    $request = [System.Net.WebRequest]::Create($endpoint)
+                    $request.Method = "GET"
+                    $request.Timeout = $Timeout * 1000
+                    $request.AllowAutoRedirect = $false # Match curl behavior for redirects
+                    $request.UserAgent = "AbsoluteDiagnostics/2.0"
+                    $request.Proxy = [System.Net.WebRequest]::GetSystemWebProxy()
+                    $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+
+                    # Get the response
                     $response = $request.GetResponse()
+                    $sw.Stop()
                     $statusCode = [int]$response.StatusCode
                     $statusDesc = $response.StatusDescription
+                    $responseTime = $sw.ElapsedMilliseconds
                 }
                 catch [System.Net.WebException] {
+                    $sw.Stop()
+                    $responseTime = $sw.ElapsedMilliseconds
                     if ($_.Exception.Response) {
                         $statusCode = [int]$_.Exception.Response.StatusCode
                         $statusDesc = $_.Exception.Response.StatusDescription
                     }
                     else {
-                        throw
+                        $statusCode = 0
+                        $statusDesc = $_.Exception.Message
                     }
                 }
                 finally {
@@ -418,12 +476,18 @@ function Test-NetworkEndpoints {
                 $expectedStatus = if ($Expected.ContainsKey($endpoint)) { $Expected[$endpoint] } else { "200" }
                 $statusMatch = $expectedStatus -split ' or ' | Where-Object { $_ -eq $statusCode.ToString() } | Select-Object -First 1
 
+                # Use already obtained ping results and response time
+                # No need to check again or recalculate response time
+
                 $results += [PSCustomObject]@{
                     URL = $endpoint
                     Status = if ($statusMatch) { "Pass" } else { "Fail" }
                     Code = $statusCode
-                    Description = $statusDesc
+                    Description = if ([string]::IsNullOrEmpty($statusDesc)) { "No response" } else { $statusDesc }
                     Expected = $expectedStatus
+                    ResponseTime = $responseTime
+                    PingStatus = if ($pingCheck.PingSuccessful) { "Success" } else { "Failed" }
+                    TraceRoute = if ($pingCheck.TraceRoute) { $pingCheck.TraceRoute -join " -> " } else { "N/A" }
                 }
             }
             catch {
@@ -431,8 +495,11 @@ function Test-NetworkEndpoints {
                     URL = $endpoint
                     Status = "Error"
                     Code = 0
-                    Description = $_.Exception.Message
+                    Description = if ([string]::IsNullOrEmpty($_.Exception.Message)) { "Unknown error" } else { $_.Exception.Message }
                     Expected = if ($Expected.ContainsKey($endpoint)) { $Expected[$endpoint] } else { "200" }
+                    ResponseTime = 0
+                    PingStatus = "Failed"
+                    TraceRoute = "N/A"
                 }
             }
         }
@@ -442,6 +509,7 @@ function Test-NetworkEndpoints {
     }
     catch {
         Write-Warning "Failed to test network endpoints: $_"
+        # Return empty array instead of throwing to allow script to continue
         return @()
     }
 }
@@ -705,6 +773,14 @@ function Copy-AdditionalLogs {
                 if (Test-Path $path) {
                     "# Registry Path: $path"
                     Get-ItemProperty -Path $path | Format-Table -AutoSize | Out-String
+                    # Get child items recursively
+                    Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                        "## $($_.Name)"
+                        $properties = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
+                        if ($properties) {
+                            $properties | Format-Table -AutoSize | Out-String
+                        }
+                    }
                     Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue |
                         ForEach-Object {
                             "## $($_.Name)"
@@ -752,11 +828,12 @@ function Export-DiagnosticsReport {
 
         Write-ProgressHelper -Status "Creating Excel workbook" -PercentComplete 20
 
-        # Create Excel package
-        $excel = New-Object OfficeOpenXml.ExcelPackage
+        try {
+            # Create Excel package
+            $excel = New-Object OfficeOpenXml.ExcelPackage $ExcelPath
 
-        # System Info worksheet
-        Write-ProgressHelper -Status "Adding system information" -PercentComplete 30
+            # System Info worksheet
+            Write-ProgressHelper -Status "Adding system information" -PercentComplete 30
         $sysWs = $excel.Workbook.Worksheets.Add("System Info")
         $row = 1
 
