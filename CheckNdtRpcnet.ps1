@@ -38,6 +38,7 @@ param(
     [switch]$SkipZip,
     [switch]$VerboseLog,
     [int]$NetworkTimeout = 10,
+    [int]$MaxParallelTasks = 5,
     [string[]]$EndpointsToCheck = @(
     "http://search.namequery.com",
     "https://search.namequery.com/ctes/1.0.0/configuration", 
@@ -58,15 +59,23 @@ param(
 # Enable TLS 1.2 and 1.3 for all HTTPS requests
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-try {
-    $currentPolicy = Get-ExecutionPolicy -Scope Process
-    if ($currentPolicy -ne 'Bypass') {
-        Write-Verbose "Setting execution policy to Bypass for current process (was: $currentPolicy)"
-        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+# Load HtmlEncode support
+Add-Type -AssemblyName System.Web
+
+# Define execution policy helper before use
+function Set-ProcessExecutionPolicy {
+    try {
+        if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
+            Write-Verbose "Setting execution policy to Bypass for current process (was: $(Get-ExecutionPolicy -Scope Process))"
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+        }
+    } catch {
+        Write-Warning "Unable to set execution policy: $_"
     }
-} catch {
-    Write-Warning "Failed to set execution policy to Bypass: $_"
 }
+
+# Set the execution policy
+Set-ProcessExecutionPolicy
 
 $env:PSModulePath = "$PSScriptRoot\Modules;$env:PSModulePath"
 
@@ -93,6 +102,17 @@ if (-not (Test-Path $OutputDirectory)) {
 Start-Transcript -Path (Join-Path $OutputDirectory "diagnostics_transcript_$(Get-Date -Format 'yyyyMMdd_HHmmss').log")
 
 # Helper Functions
+function Set-ExecutionPolicySafe {
+    try {
+        if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
+            Write-Verbose "Setting execution policy to Bypass for current process (was: $(Get-ExecutionPolicy -Scope Process))"
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+        }
+    } catch {
+        Write-Warning "Unable to set execution policy: $_"
+    }
+}
+
 function Write-ProgressHelper {
     [CmdletBinding()]
     param(
@@ -118,16 +138,6 @@ function Write-ProgressHelper {
             $statusMsg = if ([string]::IsNullOrWhiteSpace($Status) -and ![string]::IsNullOrWhiteSpace($Activity)) { $Activity } else { "Processing..." }
             Write-Progress -Id $script:ProgressId -Activity $script:ProgressActivity -Status $statusMsg -PercentComplete $percent
         }
-    }
-}
-
-function Set-ExecutionPolicySafe {
-    try {
-        if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
-            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-        }
-    } catch {
-        Write-Warning "Unable to set execution policy: $_"
     }
 }
 
@@ -189,9 +199,9 @@ function Get-SystemInfo {
         
         # Core system properties
         $coreProperties = @(
-            'CsName', 'CsDomain', 'CsUserName', 'OsName', 'OsVersion', 
-            'OsBuildNumber', 'OsArchitecture', 'CsProcessors', 'CsNumberOfProcessors',
-            'CsPhyicallyInstalledMemory', 'CsTotalPhysicalMemory'
+            'CsName','CsDomain','CsUserName','OsName','OsVersion',
+            'OsBuildNumber','OsArchitecture','CsProcessors','CsNumberOfProcessors',
+            'CsPhysicallyInstalledMemory','CsTotalPhysicalMemory'
         )
 
         # Core information
@@ -361,23 +371,75 @@ function Test-NetworkConnectivity {
         $uri = [System.Uri]$Endpoint
         $hostname = $uri.Host
 
-        # Run ping test
-        $pingResult = Test-Connection -ComputerName $hostname -Count 2 -Quiet
+        # Run ping test with timeout parameter
+        $pingParams = @{
+            ComputerName = $hostname
+            Count = 2
+            BufferSize = 32
+            Quiet = $true
+        }
+        
+        # Add timeout parameter if available in current PowerShell version
+        if ((Get-Command Test-Connection).Parameters.ContainsKey('TimeoutSeconds')) {
+            $pingParams['TimeoutSeconds'] = $Timeout
+        }
+        
+        $pingResult = Test-Connection @pingParams
 
         # Run traceroute (limited to 15 hops for performance)
         $traceOutput = @()
+        $fullTrace = @()
         try {
             $traceRoute = Test-NetConnection -ComputerName $hostname -TraceRoute -Hops 15 -WarningAction SilentlyContinue
-            $traceOutput = $traceRoute.TraceRoute
+            if ($traceRoute.TraceRoute) {
+                $traceOutput = $traceRoute.TraceRoute
+                $fullTrace = $traceRoute.TraceRoute
+            }
         }
         catch {
             $traceOutput = @("Traceroute failed: $($_.Exception.Message)")
+        }
+
+        # Get certificate info for HTTPS URLs
+        $certInfo = "N/A"
+        if ($uri.Scheme -eq "https") {
+            try {
+                $req = [System.Net.HttpWebRequest]::Create($Endpoint)
+                $req.Timeout = $Timeout * 1000
+                $req.ServerCertificateValidationCallback = {$true}  # Ignore certificate errors
+                
+                try {
+                    $response = $req.GetResponse()
+                    $cert = $req.ServicePoint.Certificate
+                    
+                    if ($cert) {
+                        $certDetails = @(
+                            "Issuer: $($cert.Issuer)",
+                            "Subject: $($cert.Subject)",
+                            "Valid from: $($cert.GetEffectiveDateString())",
+                            "Valid to: $($cert.GetExpirationDateString())",
+                            "Serial: $($cert.GetSerialNumberString())"
+                        ) -join " | "
+                        $certInfo = $certDetails
+                    }
+                    
+                    if ($response) { $response.Dispose() }
+                }
+                catch {
+                    $certInfo = "Error getting certificate: $($_.Exception.Message)"
+                }
+            }
+            catch {
+                $certInfo = "Error accessing certificate: $($_.Exception.Message)"
+            }
         }
 
         return @{
             Host = $hostname
             PingSuccessful = $pingResult
             TraceRoute = $traceOutput
+            FullTraceRoute = $fullTrace
+            CertificateInfo = $certInfo
         }
     }
     catch {
@@ -385,6 +447,8 @@ function Test-NetworkConnectivity {
             Host = "Unknown"
             PingSuccessful = $false
             TraceRoute = @("Error: $($_.Exception.Message)")
+            FullTraceRoute = @()
+            CertificateInfo = "N/A"
         }
     }
 }
@@ -393,33 +457,46 @@ function Test-NetworkEndpoints {
     param (
         [string[]]$Endpoints,
         [hashtable]$Expected,
-        [int]$Timeout = 10
+        [int]$Timeout = 10,
+        [int]$MaxParallel = 5
     )
 
     Write-ProgressHelper -Activity "Testing network connectivity" -Status "Checking endpoints"
 
     try {
-        $results = @()
+        # Create a thread-safe collection for results
+        $results = [System.Collections.Concurrent.ConcurrentBag[PSObject]]::new()
         
-        foreach ($endpoint in $Endpoints) {
-            Write-ProgressHelper -Activity "Testing network connectivity" -Status "Testing $endpoint"
+        # Cache for system proxy to avoid repeatedly getting it
+        $systemProxy = [System.Net.WebRequest]::GetSystemWebProxy()
+        $defaultCredentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+        
+        # Create script block for testing a single endpoint
+        $testEndpointScript = {
+            param (
+                [string]$Endpoint,
+                [hashtable]$Expected,
+                [int]$Timeout,
+                [System.Net.IWebProxy]$SystemProxy,
+                [System.Net.NetworkCredential]$ProxyCredentials
+            )
             
             try {
                 # Get ping and traceroute results first
-                $pingCheck = Test-NetworkConnectivity -Endpoint $endpoint -Timeout $Timeout
+                $pingCheck = Test-NetworkConnectivity -Endpoint $Endpoint -Timeout $Timeout
 
                 # Create stopwatch for timing
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
                 try {
                     # Create and configure the request
-                    $request = [System.Net.WebRequest]::Create($endpoint)
+                    $request = [System.Net.WebRequest]::Create($Endpoint)
                     $request.Method = "GET"
                     $request.Timeout = $Timeout * 1000
                     $request.AllowAutoRedirect = $false # Match curl behavior for redirects
                     $request.UserAgent = "AbsoluteDiagnostics/2.0"
-                    $request.Proxy = [System.Net.WebRequest]::GetSystemWebProxy()
-                    $request.Proxy.Credentials = [System.Net.CredentialCache]::DefaultNetworkCredentials
+                    $request.Proxy = $SystemProxy
+                    $request.Proxy.Credentials = $ProxyCredentials
 
                     # Get the response
                     $response = $request.GetResponse()
@@ -444,14 +521,11 @@ function Test-NetworkEndpoints {
                     if ($response) { $response.Dispose() }
                 }
 
-                $expectedStatus = if ($Expected.ContainsKey($endpoint)) { $Expected[$endpoint] } else { "200" }
+                $expectedStatus = if ($Expected.ContainsKey($Endpoint)) { $Expected[$Endpoint] } else { "200" }
                 $statusMatch = $expectedStatus -split ' or ' | Where-Object { $_ -eq $statusCode.ToString() } | Select-Object -First 1
 
-                # Use already obtained ping results and response time
-                # No need to check again or recalculate response time
-
-                $results += [PSCustomObject]@{
-                    URL = $endpoint
+                return [PSCustomObject]@{
+                    URL = $Endpoint
                     Status = if ($statusMatch) { "Pass" } else { "Fail" }
                     Code = $statusCode
                     Description = if ([string]::IsNullOrEmpty($statusDesc)) { "No response" } else { $statusDesc }
@@ -459,24 +533,69 @@ function Test-NetworkEndpoints {
                     ResponseTime = $responseTime
                     PingStatus = if ($pingCheck.PingSuccessful) { "Success" } else { "Failed" }
                     TraceRoute = if ($pingCheck.TraceRoute) { $pingCheck.TraceRoute -join " -> " } else { "N/A" }
+                    FullTraceRoute = $pingCheck.FullTraceRoute
+                    CertificateInfo = $pingCheck.CertificateInfo
                 }
             }
             catch {
-                $results += [PSCustomObject]@{
-                    URL = $endpoint
+                return [PSCustomObject]@{
+                    URL = $Endpoint
                     Status = "Error"
                     Code = 0
                     Description = if ([string]::IsNullOrEmpty($_.Exception.Message)) { "Unknown error" } else { $_.Exception.Message }
-                    Expected = if ($Expected.ContainsKey($endpoint)) { $Expected[$endpoint] } else { "200" }
+                    Expected = if ($Expected.ContainsKey($Endpoint)) { $Expected[$Endpoint] } else { "200" }
                     ResponseTime = 0
                     PingStatus = "Failed"
                     TraceRoute = "N/A"
+                    FullTraceRoute = @()
+                    CertificateInfo = "N/A"
                 }
+            }
+        }
+        
+        # Check if running in PowerShell Core (supports parallel processing)
+        $canRunParallel = $PSVersionTable.PSVersion.Major -ge 7
+        
+        if ($canRunParallel) {
+            try {
+                # Use ForEach-Object -Parallel in PowerShell 7+
+                $parallelResults = $Endpoints | ForEach-Object -ThrottleLimit $MaxParallel -Parallel {
+                    # Display progress in the parallel thread
+                    Write-Host "Testing $_ ..." -ForegroundColor Cyan
+                    
+                    # Call the script block with parameters
+                    & $using:testEndpointScript -Endpoint $_ -Expected $using:Expected -Timeout $using:Timeout -SystemProxy $using:systemProxy -ProxyCredentials $using:defaultCredentials
+                }
+                
+                # Add all results to the concurrent bag
+                foreach ($result in $parallelResults) {
+                    $results.Add($result)
+                }
+            }
+            catch {
+                Write-Warning "Error in parallel processing: $_. Falling back to sequential processing."
+                # Fall back to sequential processing
+                $canRunParallel = $false
+            }
+        }
+        
+        # If parallel processing isn't available or failed, use sequential approach
+        if (-not $canRunParallel) {
+            $total = $Endpoints.Count
+            $current = 0
+            
+            foreach ($endpoint in $Endpoints) {
+                $current++
+                $progressPercent = [math]::Round(($current / $total) * 100)
+                Write-ProgressHelper -Activity "Testing network connectivity" -Status "Testing $endpoint ($current of $total)" -PercentComplete $progressPercent
+                
+                $result = & $testEndpointScript -Endpoint $endpoint -Expected $Expected -Timeout $Timeout -SystemProxy $systemProxy -ProxyCredentials $defaultCredentials
+                $results.Add($result)
             }
         }
 
         Write-ProgressHelper -Activity "Testing network connectivity" -Status "Completed endpoint testing" -Completed
-        return $results
+        return $results.ToArray() | Sort-Object URL
     }
     catch {
         Write-Warning "Failed to test network endpoints: $_"
@@ -731,7 +850,6 @@ function Copy-AdditionalLogs {
         }
 
         # Also collect registry settings
-        $regFile = Join-Path $OutputFolder "AbsoluteRegistry.txt"
         try {
             $regPaths = @(
                 "HKLM:\SOFTWARE\Absolute",
@@ -744,19 +862,11 @@ function Copy-AdditionalLogs {
                 if (Test-Path $path) {
                     "# Registry Path: $path"
                     Get-ItemProperty -Path $path | Format-Table -AutoSize | Out-String
-                    # Get child items recursively
-                    Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
-                        "## $($_.Name)"
-                        $properties = Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue
-                        if ($properties) {
-                            $properties | Format-Table -AutoSize | Out-String
-                        }
+                    # get child items once
+                    Get-ChildItem -Path $path -Recurse -ErrorAction SilentlyContinue | ForEach-Object {
+                        "## $($_.PSChildName)"
+                        Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue | Format-Table -AutoSize | Out-String
                     }
-                    Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue |
-                        ForEach-Object {
-                            "## $($_.Name)"
-                            Get-ItemProperty -Path $_.PSPath | Format-Table -AutoSize | Out-String
-                        }
                 }
             }
 
@@ -799,8 +909,14 @@ function Export-DiagnosticsReport {
 
         Write-ProgressHelper -Status "Creating Excel workbook" -PercentComplete 20
 
-        # Create Excel package
-        $excel = New-Object OfficeOpenXml.ExcelPackage
+        # Create Excel package with better error handling
+        try {
+            $excel = New-Object OfficeOpenXml.ExcelPackage
+        }
+        catch {
+            Write-Warning "Failed to initialize Excel package: $_"
+            throw "Unable to create Excel report. Ensure ImportExcel module is properly installed."
+        }
 
         # System Info worksheet
         Write-ProgressHelper -Status "Adding system information" -PercentComplete 30
@@ -843,15 +959,15 @@ function Export-DiagnosticsReport {
 
         $sysWs.Cells.AutoFitColumns()
 
-        # Network Results worksheet
+        # Network Results worksheet with enhanced traceroute details
         Write-ProgressHelper -Status "Adding network information" -PercentComplete 50
         $netWs = $excel.Workbook.Worksheets.Add("Network")
         $row = 1
 
         $netWs.Cells["A$row"].Value = "Network Connectivity Tests"
-        $netWs.Cells["A$row:G$row"].Merge = $true
-        $netWs.Cells["A$row:G$row"].Style.Font.Bold = $true
-        $netWs.Cells["A$row:G$row"].Style.Font.Size = 14
+        $netWs.Cells["A$row:H$row"].Merge = $true
+        $netWs.Cells["A$row:H$row"].Style.Font.Bold = $true
+        $netWs.Cells["A$row:H$row"].Style.Font.Size = 14
         $row++
 
         $netWs.Cells["A$row"].Value = "URL"
@@ -861,7 +977,8 @@ function Export-DiagnosticsReport {
         $netWs.Cells["E$row"].Value = "Expected"
         $netWs.Cells["F$row"].Value = "Response Time (ms)"
         $netWs.Cells["G$row"].Value = "Ping Status"
-        $netWs.Cells["A$row:G$row"].Style.Font.Bold = $true
+        $netWs.Cells["H$row"].Value = "Certificate Info"
+        $netWs.Cells["A$row:H$row"].Style.Font.Bold = $true
         $row++
 
         foreach ($item in $NetResults) {
@@ -872,6 +989,7 @@ function Export-DiagnosticsReport {
             $netWs.Cells["E$row"].Value = $item.Expected
             $netWs.Cells["F$row"].Value = $item.ResponseTime
             $netWs.Cells["G$row"].Value = $item.PingStatus
+            $netWs.Cells["H$row"].Value = $item.CertificateInfo
 
             # Colorize status
             switch ($item.Status) {
@@ -890,6 +1008,41 @@ function Export-DiagnosticsReport {
         }
 
         $netWs.Cells.AutoFitColumns()
+
+        # Detailed traceroute information in a separate sheet
+        if ($NetResults | Where-Object { $_.TraceRoute }) {
+            $traceWs = $excel.Workbook.Worksheets.Add("TraceRoute")
+            $row = 1
+
+            $traceWs.Cells["A$row"].Value = "Detailed Traceroute Information"
+            $traceWs.Cells["A$row:C$row"].Merge = $true
+            $traceWs.Cells["A$row:C$row"].Style.Font.Bold = $true
+            $traceWs.Cells["A$row:C$row"].Style.Font.Size = 14
+            $row++
+
+            $traceWs.Cells["A$row"].Value = "Endpoint"
+            $traceWs.Cells["B$row"].Value = "Hop"
+            $traceWs.Cells["C$row"].Value = "IP Address"
+            $traceWs.Cells["A$row:C$row"].Style.Font.Bold = $true
+            $row++
+
+            foreach ($item in $NetResults) {
+                if ($item.FullTraceRoute) {
+                    $hopNumber = 1
+                    foreach ($hop in $item.FullTraceRoute) {
+                        $traceWs.Cells["A$row"].Value = $item.URL
+                        $traceWs.Cells["B$row"].Value = $hopNumber
+                        $traceWs.Cells["C$row"].Value = $hop
+                        $hopNumber++
+                        $row++
+                    }
+                    # Add a blank row between different endpoints
+                    $row++
+                }
+            }
+            
+            $traceWs.Cells.AutoFitColumns()
+        }
 
         # Services worksheet
         Write-ProgressHelper -Status "Adding service information" -PercentComplete 70
@@ -958,9 +1111,14 @@ function Export-DiagnosticsReport {
                 $ctesWs.Cells["A$row"].Value = $log.Name
                 $ctesWs.Cells["B$row"].Value = $log.LastWriteTime
                 $ctesWs.Cells["C$row"].Value = $log.Path
-                # Get first few lines of content as summary
-                $summary = $log.Content -split "`n" | Select-Object -First 5 | Out-String
-                $ctesWs.Cells["D$row"].Value = if ($summary) { $summary.Trim() } else { "N/A" }
+                # Get first few lines of content as summary (safely handling large files)
+                try {
+                    $summary = $log.Content -split "`n" | Select-Object -First 5 | Out-String
+                    $ctesWs.Cells["D$row"].Value = if ($summary) { $summary.Trim() } else { "N/A" }
+                }
+                catch {
+                    $ctesWs.Cells["D$row"].Value = "Error reading log content: $($_.Exception.Message)"
+                }
                 $row++
             }
 
@@ -990,25 +1148,152 @@ function Export-DiagnosticsReport {
 
         # DDSNdt Logs
         if ($DDSLog -and $DDSLog.Count -gt 0) {
-            $ddsWs = $excel.Workbook.Worksheets.Add("DDSNdt Logs")
-            $row = 1
+            Write-ProgressHelper -Status "Adding DDSNdt logs" -PercentComplete 85
+            try {
+                $ddsWs = $excel.Workbook.Worksheets.Add("DDSNdt Logs")
+                $row = 1
 
-            $ddsWs.Cells["A$row"].Value = "DDSNdt Network Diagnostic Log"
-            $ddsWs.Cells["A$row"].Style.Font.Bold = $true
-            $ddsWs.Cells["A$row"].Style.Font.Size = 14
-            $row++
-
-            foreach ($line in $DDSLog) {
-                $ddsWs.Cells["A$row"].Value = $line
+                $ddsWs.Cells["A$row"].Value = "DDSNdt Network Diagnostic Log"
+                $ddsWs.Cells["A$row"].Style.Font.Bold = $true
+                $ddsWs.Cells["A$row"].Style.Font.Size = 14
                 $row++
-            }
 
-            $ddsWs.Cells.AutoFitColumns()
+                foreach ($line in $DDSLog) {
+                    $ddsWs.Cells["A$row"].Value = $line
+                    $row++
+                }
+                $ddsWs.Cells.AutoFitColumns()
+            } catch {
+                Write-Warning "Failed to add DDSNdt logs: $_"
+            }
         }
 
-        # Save the Excel report
-        $excel.SaveAs($ExcelPath)
-        Write-Verbose "Excel report saved to: $ExcelPath"
+        # Add summary page as the first worksheet
+        $summaryWs = $excel.Workbook.Worksheets.Add("Summary")
+        $excel.Workbook.Worksheets.MoveToStart("Summary")
+        
+        $row = 1
+        $summaryWs.Cells["A$row"].Value = "Absolute Agent Diagnostics Summary"
+        $summaryWs.Cells["A$row:C$row"].Merge = $true
+        $summaryWs.Cells["A$row:C$row"].Style.Font.Bold = $true
+        $summaryWs.Cells["A$row:C$row"].Style.Font.Size = 16
+        $row++
+
+        $summaryWs.Cells["A$row"].Value = "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+        $summaryWs.Cells["A$row:C$row"].Merge = $true
+        $row += 2
+
+        $summaryWs.Cells["A$row"].Value = "System Info"
+        $summaryWs.Cells["A$row"].Style.Font.Bold = $true
+        $row++
+        $summaryWs.Cells["A$row"].Value = "Computer Name"
+        $computerName = ($SystemInfo | Where-Object { $_.Property -eq 'CsName' }).Value
+        $summaryWs.Cells["B$row"].Value = $computerName
+        $row++
+        $summaryWs.Cells["A$row"].Value = "Operating System"
+        $osInfo = ($SystemInfo | Where-Object { $_.Property -eq 'OsName' }).Value
+        $summaryWs.Cells["B$row"].Value = $osInfo
+        $row += 2
+
+        $summaryWs.Cells["A$row"].Value = "Network Tests"
+        $summaryWs.Cells["A$row"].Style.Font.Bold = $true
+        $row++
+        $passCount = ($NetResults | Where-Object { $_.Status -eq 'Pass' }).Count
+        $failCount = ($NetResults | Where-Object { $_.Status -eq 'Fail' }).Count
+        $errorCount = ($NetResults | Where-Object { $_.Status -eq 'Error' }).Count
+        $totalTests = $NetResults.Count
+        
+        $summaryWs.Cells["A$row"].Value = "Tests Passed"
+        $summaryWs.Cells["B$row"].Value = "$passCount of $totalTests"
+        if ($passCount -eq $totalTests) {
+            $summaryWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGreen)
+        }
+        elseif ($passCount -eq 0) {
+            $summaryWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightCoral)
+        }
+        elseif ($passCount -lt ($totalTests / 2)) {
+            $summaryWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightYellow)
+        }
+        $row++
+        
+        # Add the failed tests count information
+        $summaryWs.Cells["A$row"].Value = "Tests Failed"
+        $summaryWs.Cells["B$row"].Value = "$failCount of $totalTests"
+        if ($failCount -gt 0) {
+            $summaryWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightCoral)
+        }
+        $row++
+        
+        # Add the error count information
+        $summaryWs.Cells["A$row"].Value = "Tests with Errors"
+        $summaryWs.Cells["B$row"].Value = "$errorCount of $totalTests"
+        if ($errorCount -gt 0) {
+            $summaryWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightYellow)
+        }
+        $row += 1
+
+        $summaryWs.Cells["A$row"].Value = "Services"
+        $summaryWs.Cells["A$row"].Style.Font.Bold = $true
+        $row++
+        $runningServices = ($ServiceStatus | Where-Object { $_.Status -eq 'Running' }).Count
+        $stoppedServices = ($ServiceStatus | Where-Object { $_.Status -eq 'Stopped' }).Count
+        $notFoundServices = ($ServiceStatus | Where-Object { $_.Status -eq 'Not Found' }).Count
+        $totalServices = $ServiceStatus.Count
+
+        $summaryWs.Cells["A$row"].Value = "Running Services"
+        $summaryWs.Cells["B$row"].Value = "$runningServices of $totalServices"
+        if ($runningServices -eq $totalServices) {
+            $summaryWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGreen)
+        }
+        elseif ($runningServices -eq 0) {
+            $summaryWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightCoral)
+        }
+        $row++
+        
+        $summaryWs.Cells["A$row"].Value = "Stopped Services"
+        $summaryWs.Cells["B$row"].Value = "$stoppedServices of $totalServices"
+        if ($stoppedServices -gt 0) {
+            $summaryWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightYellow)
+        }
+        $row++
+        
+        $summaryWs.Cells["A$row"].Value = "Not Found Services"
+        $summaryWs.Cells["B$row"].Value = "$notFoundServices of $totalServices"
+        if ($notFoundServices -gt 0) {
+            $summaryWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+            $summaryWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightCoral)
+        }
+        $row++
+        
+        $summaryWs.Cells.AutoFitColumns()
+
+        # Save the Excel report with better error handling
+        try {
+            $excel.SaveAs($ExcelPath)
+            Write-Verbose "Excel report saved to: $ExcelPath"
+        }
+        catch {
+            Write-Warning "Failed to save Excel report to $ExcelPath $($_)"
+            # Try an alternative path in temp directory as fallback
+            $fallbackPath = Join-Path ([System.IO.Path]::GetTempPath()) ("AbsoluteDiagnosticsReport_" + (Get-Date -Format 'yyyyMMddHHmmss') + ".xlsx")
+            try {
+                $excel.SaveAs($fallbackPath)
+                Write-Warning "Excel report saved to fallback location: $fallbackPath"
+                return $true
+            }
+            catch {
+                Write-Warning "Failed to save Excel report to fallback location: $_"
+                return $false
+            }
+        }
 
         Write-ProgressHelper -Activity "Creating Excel report" -Completed
         return $true
@@ -1018,15 +1303,23 @@ function Export-DiagnosticsReport {
         return $false
     }
     finally {
+        # Ensure Excel package is properly disposed
         if ($excel) {
-            $excel.Dispose()
+            try {
+                $excel.Dispose()
+            }
+            catch {
+                Write-Warning "Error disposing Excel package: $_"
+            }
         }
     }
 }
 
 function Get-CtesLogs {
     param (
-        [string]$LogPath = "C:\ProgramData\CTES\logs"
+        [string]$LogPath = "C:\ProgramData\CTES\logs",
+        [int]$MaxLogSizeMB = 10, # Skip reading full content of files larger than this size
+        [int]$MaxPreviewLines = 200 # For large files, only show first and last lines
     )
 
     try {
@@ -1035,15 +1328,73 @@ function Get-CtesLogs {
             return @()
         }
 
-        $logs = Get-ChildItem -Path $LogPath -File -Recurse -ErrorAction SilentlyContinue |
-            ForEach-Object {
+        # Get all log files
+        $logFiles = Get-ChildItem -Path $LogPath -File -Recurse -ErrorAction SilentlyContinue
+        
+        # Process files in batches to improve performance
+        $batchSize = 10
+        $totalFiles = $logFiles.Count
+        $processedCount = 0
+        $logs = @()
+        
+        for ($i = 0; $i -lt $totalFiles; $i += $batchSize) {
+            $batch = $logFiles[$i..([Math]::Min($i + $batchSize - 1, $totalFiles - 1))]
+            
+            $batchResults = foreach ($file in $batch) {
+                $processedCount++
+                if ($processedCount % 5 -eq 0) {
+                    Write-Verbose "Processing log file $processedCount of ${totalFiles}: $($file.Name)"
+                }
+                
+                $fileSizeMB = $file.Length / 1MB
+                $content = $null
+                
+                # For large files, only get preview
+                if ($fileSizeMB -gt $MaxLogSizeMB) {
+                    try {
+                        # Get first and last lines only
+                        $firstLines = Get-Content -Path $file.FullName -TotalCount ($MaxPreviewLines / 2) -ErrorAction SilentlyContinue
+                        $lastLines = Get-Content -Path $file.FullName -Tail ($MaxPreviewLines / 2) -ErrorAction SilentlyContinue
+                        
+                        if ($firstLines -or $lastLines) {
+                            $preview = @()
+                            if ($firstLines) { $preview += $firstLines }
+                            $preview += "..."
+                            $preview += "[File truncated, total size: $([Math]::Round($fileSizeMB, 2)) MB]"
+                            $preview += "..."
+                            if ($lastLines) { $preview += $lastLines }
+                            $content = $preview -join "`r`n"
+                        }
+                        else {
+                            $content = "[Unable to read file content, file may be locked or too large ($([Math]::Round($fileSizeMB, 2)) MB)]"
+                        }
+                    }
+                    catch {
+                        $content = "[Error reading large file: $($_.Exception.Message)]"
+                    }
+                }
+                else {
+                    # For smaller files, get full content
+                    try {
+                        $content = Get-Content -Path $file.FullName -Raw -ErrorAction SilentlyContinue
+                        if ($null -eq $content) { $content = "[Empty file]" }
+                    }
+                    catch {
+                        $content = "[Error reading file: $($_.Exception.Message)]"
+                    }
+                }
+                
                 [PSCustomObject]@{
-                    Name = $_.Name
-                    Path = $_.FullName
-                    Content = Get-Content -Path $_.FullName -Raw -ErrorAction SilentlyContinue
-                    LastWriteTime = $_.LastWriteTime
+                    Name = $file.Name
+                    Path = $file.FullName
+                    Content = $content
+                    LastWriteTime = $file.LastWriteTime
+                    SizeMB = [Math]::Round($fileSizeMB, 2)
                 }
             }
+            
+            $logs += $batchResults
+        }
 
         return $logs
     }
@@ -1076,7 +1427,7 @@ try {
     $serviceResults = Test-Services
 
     # Test network connectivity
-    $networkResults = Test-NetworkEndpoints -Endpoints $EndpointsToCheck -Expected $ExpectedStatusCodes -Timeout $NetworkTimeout
+    $networkResults = Test-NetworkEndpoints -Endpoints $EndpointsToCheck -Expected $ExpectedStatusCodes -Timeout $NetworkTimeout -MaxParallel $MaxParallelTasks
 
     # Run AbtPS diagnostics if available
     $abtPSResults = @()
