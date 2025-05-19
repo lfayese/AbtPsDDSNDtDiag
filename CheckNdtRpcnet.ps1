@@ -1,25 +1,41 @@
 <#
 .SYNOPSIS
-Absolute Agent Diagnostic Collector
+Comprehensive diagnostic collector for Absolute agent and related services.
 
 .DESCRIPTION
-Runs Absolute agent diagnostics: system info, endpoints, CTES logs, AbtPS/DDSNdt, ZIP/Excel output.
+Performs a thorough diagnostic collection and analysis of the Absolute agent environment:
+- System information and configuration
+- Network endpoint connectivity tests with detailed status
+- CTES logs collection and analysis
+- Absolute service status (rpcnet, rpcnetp, rpcnetc)
+- AbtPS and DDSNdt diagnostic tool execution
+- Registry settings export
+- Generates both HTML and optional Excel reports
+- Creates a consolidated ZIP archive of all findings
 
 .EXAMPLE
-.\CheckNdtRpcnet.ps1 -VerboseLog
-.\CheckNdtRpcnet.ps1 -OutputDirectory "C:\Temp\Diag" -SkipZip
-.\CheckNdtRpcnet.ps1 -SkipExcel
+# Run basic diagnostics with default HTML report
+.\CheckNdtRpcnet.ps1
+
+.EXAMPLE
+# Generate both HTML and Excel reports with verbose logging
+.\CheckNdtRpcnet.ps1 -IncludeExcel -VerboseLog
+
+.EXAMPLE
+# Specify custom output directory and skip ZIP creation
+.\CheckNdtRpcnet.ps1 -OutputDirectory "C:\Temp\Diagnostics" -SkipZip
 
 .NOTES
-Enhanced with additional diagnostics, error handling, and performance optimizations.
+Version: 2.0
+Author: Absolute Software
+Last Updated: 2025-05-19
 #>
 
 [CmdletBinding()]
 param(
     [int]$CallTimeoutSec = 60,
-    [switch]$SkipExcel,
+    [switch]$IncludeExcel,
     [switch]$SkipZip,
-    [switch]$SkipHtml,
     [switch]$VerboseLog,
     [int]$NetworkTimeout = 10,
     [string[]]$EndpointsToCheck = @(
@@ -34,7 +50,7 @@ param(
         "https://search.namequery.com/ctes/1.0.0/configuration" = "401";
         "https://search.namequery.com/downloads/public/bin/Windows/CTES/CTES/1.0.0.3316/filelist.txt" = "200";
         "https://deviceapi.ca1.absolute.com/ctes/1.0.0/configuration" = "401";
-        "https://resources.namequery.com/downloads/public/bin/Windows/CTES/HDC/2.0.15.13/CtHWiPrvPackage.zip" = "200"
+        "https://resources.namequery.com/downloads/public/bin/Windows/CTES/HDC/2.0.15.13/CtHWiPrvPackage.zip" = "404 or 200"
     },
     [string]$OutputDirectory = $PSScriptRoot
 )
@@ -148,50 +164,28 @@ function New-DiagnosticsFolder {
 }
 
 function Get-SystemInfo {
-    Write-ProgressHelper -Activity "Collecting system information" -Status "Gathering basic system details"
+    Write-ProgressHelper -Activity "Collecting system information" -Status "Gathering system details"
 
     try {
-        $bios = Get-CimInstance Win32_BIOS
-        $sys = Get-CimInstance Win32_ComputerSystem
-        $os = Get-CimInstance Win32_OperatingSystem
+        $computerInfo = Get-ComputerInfo
 
-        $core = [PSCustomObject]@{
-            BIOSSerial = $bios.SerialNumber
-            ComputerName = $sys.Name
-            Manufacturer = $sys.Manufacturer
-            Model = $sys.Model
-            OS = "$($os.Caption) $($os.Version)"
-        }
-
-        # Convert core info to key-value pairs for consistent reporting
-        $coreFormatted = $core | Get-Member -MemberType Properties |
-            Select-Object @{Name='Property';Expression={$_.Name}},
-                          @{Name='Value';Expression={$core.($_.Name)}}
-
-        Write-ProgressHelper -Status "Gathering extended system information" -PercentComplete 50
-
-        try {
-            $extended = Get-ComputerInfo
-
-            # Convert extended info to key-value pairs
-            $extendedFormatted = $extended | Get-Member -MemberType Properties |
-                Where-Object { $_.Name -ne 'PSComputerName' } |
-                Select-Object @{Name='Property';Expression={$_.Name}},
-                              @{Name='Value';Expression={$extended.($_.Name)}}
-        }
-        catch {
-            Write-Warning "Unable to retrieve extended system info: $_"
-            $extendedFormatted = @()
-            $extended = @()
-        }
+        # Convert computer info to a formatted list, excluding empty values
+        $formattedInfo = $computerInfo | 
+            Get-Member -MemberType Properties |
+            Where-Object { 
+                $value = $computerInfo.($_.Name)
+                $null -ne $value -and $value -ne '' -and $value -notmatch '^\s+$'
+            } |
+            Select-Object @{
+                Name='Property';
+                Expression={$_.Name}
+            }, @{
+                Name='Value';
+                Expression={$computerInfo.($_.Name)}
+            }
 
         Write-ProgressHelper -Activity "Collecting system information" -Completed
-        return @{
-            Core = $core
-            CoreFormatted = $coreFormatted
-            Extended = $extended
-            ExtendedFormatted = $extendedFormatted
-        }
+        return $formattedInfo
     }
     catch {
         Write-Warning "Failed to collect system information: $_"
@@ -491,7 +485,8 @@ function Export-HtmlReport {
         [array]$AbtPSLog,
         [array]$NetResults,
         [array]$DDSLog,
-        [array]$ServiceStatus
+        [array]$ServiceStatus,
+        [array]$CtesLogs
     )
 
     Write-ProgressHelper -Activity "Creating HTML report" -Status "Preparing data"
@@ -517,7 +512,22 @@ function Export-HtmlReport {
         $html.Add('        .notfound { background-color: #eee; }')
         $html.Add('        .timestamp { color: #666; font-style: italic; margin-bottom: 20px; }')
         $html.Add('        .footer { margin-top: 30px; text-align: center; font-size: 12px; color: #666; }')
+        $html.Add('        .collapsible { cursor: pointer; padding: 10px; border: none; text-align: left; outline: none; width: 100%; }')
+        $html.Add('        .active, .collapsible:hover { background-color: #f8f9fa; }')
+        $html.Add('        .content { padding: 0 18px; display: none; overflow: hidden; background-color: #f8f9fa; }')
+        $html.Add('        .log-content { font-family: monospace; white-space: pre-wrap; max-height: 400px; overflow-y: auto; }')
         $html.Add('    </style>')
+        $html.Add('    <script>')
+        $html.Add('        function toggleCollapsible(element) {')
+        $html.Add('            element.classList.toggle("active");')
+        $html.Add('            var content = element.nextElementSibling;')
+        $html.Add('            if (content.style.display === "block") {')
+        $html.Add('                content.style.display = "none";')
+        $html.Add('            } else {')
+        $html.Add('                content.style.display = "block";')
+        $html.Add('            }')
+        $html.Add('        }')
+        $html.Add('    </script>')
         $html.Add('</head>')
         $html.Add('<body>')
         $html.Add('    <div class="container">')
@@ -533,10 +543,23 @@ function Export-HtmlReport {
         }
         $html.Add('        </table>')
 
+        if ($ExtendedInfo -and $ExtendedInfo.Count -gt 0) {
+            $html.Add('        <h3>Extended System Information</h3>')
+            $html.Add('        <button class="collapsible" onclick="toggleCollapsible(this)">Show Extended Info</button>')
+            $html.Add('        <div class="content">')
+            $html.Add('            <table>')
+            $html.Add('                <tr><th>Property</th><th>Value</th></tr>')
+            foreach ($item in $ExtendedInfo) {
+                $html.Add("                <tr><td>$($item.Property)</td><td>$($item.Value)</td></tr>")
+            }
+            $html.Add('            </table>')
+            $html.Add('        </div>')
+        }
+
         # Network Connectivity
         $html.Add('        <h2>Network Connectivity Tests</h2>')
         $html.Add('        <table>')
-        $html.Add('            <tr><th>URL</th><th>Status</th><th>Code</th><th>Description</th><th>Expected</th><th>Response Time (ms)</th></tr>')
+        $html.Add('            <tr><th>URL</th><th>Status</th><th>Code</th><th>Description</th><th>Expected</th><th>Response Time (ms)</th><th>Ping Status</th></tr>')
         foreach ($item in $NetResults) {
             $statusClass = switch ($item.Status) {
                 'Pass' { 'pass' }
@@ -551,6 +574,7 @@ function Export-HtmlReport {
             $html.Add("                <td>$($item.Description)</td>")
             $html.Add("                <td>$($item.Expected)</td>")
             $html.Add("                <td>$($item.ResponseTime)</td>")
+            $html.Add("                <td>$($item.PingStatus)</td>")
             $html.Add("            </tr>")
         }
         $html.Add('        </table>')
@@ -575,6 +599,44 @@ function Export-HtmlReport {
             $html.Add("            </tr>")
         }
         $html.Add('        </table>')
+
+        # CTES Logs
+        if ($CtesLogs -and $CtesLogs.Count -gt 0) {
+            $html.Add('        <h2>CTES Logs</h2>')
+            foreach ($log in $CtesLogs) {
+                $html.Add("        <button class='collapsible' onclick='toggleCollapsible(this)'>$($log.Name) - Last Modified: $($log.LastWriteTime)</button>")
+                $html.Add('        <div class="content">')
+                $html.Add('            <div class="log-content">')
+                $html.Add([System.Web.HttpUtility]::HtmlEncode($log.Content))
+                $html.Add('            </div>')
+                $html.Add('        </div>')
+            }
+        }
+
+        # Diagnostic Logs
+        if ($AbtPSLog -and $AbtPSLog.Count -gt 0) {
+            $html.Add('        <h2>AbtPS Diagnostics</h2>')
+            $html.Add("        <button class='collapsible' onclick='toggleCollapsible(this)'>Show AbtPS Diagnostic Log</button>")
+            $html.Add('        <div class="content">')
+            $html.Add('            <div class="log-content">')
+            foreach ($line in $AbtPSLog) {
+                $html.Add([System.Web.HttpUtility]::HtmlEncode($line))
+            }
+            $html.Add('            </div>')
+            $html.Add('        </div>')
+        }
+
+        if ($DDSLog -and $DDSLog.Count -gt 0) {
+            $html.Add('        <h2>Network Diagnostics</h2>')
+            $html.Add("        <button class='collapsible' onclick='toggleCollapsible(this)'>Show Network Diagnostic Log</button>")
+            $html.Add('        <div class="content">')
+            $html.Add('            <div class="log-content">')
+            foreach ($line in $DDSLog) {
+                $html.Add([System.Web.HttpUtility]::HtmlEncode($line))
+            }
+            $html.Add('            </div>')
+            $html.Add('        </div>')
+        }
 
         $html.Add('        <div class="footer">Absolute Agent Diagnostics | ' + $env:COMPUTERNAME + '</div>')
         $html.Add('    </div>')
@@ -668,7 +730,8 @@ function Export-DiagnosticsReport {
         [array]$AbtPSLog,
         [array]$NetResults,
         [array]$DDSLog,
-        [array]$ServiceStatus
+        [array]$ServiceStatus,
+        [array]$CtesLogs
     )
 
     Write-ProgressHelper -Activity "Creating Excel report" -Status "Preparing data"
@@ -702,7 +765,7 @@ function Export-DiagnosticsReport {
 
         foreach ($item in $SystemInfo) {
             $sysWs.Cells["A$row"].Value = $item.Property
-            $sysWs.Cells["B$row"].Value = $item.Value
+            $sysWs.Cells["B$row"].Value = if ($null -eq $item.Value) { "N/A" } else { $item.Value.ToString() }
             $row++
         }
 
@@ -719,7 +782,7 @@ function Export-DiagnosticsReport {
 
         foreach ($item in $ExtendedInfo) {
             $sysWs.Cells["A$row"].Value = $item.Property
-            $sysWs.Cells["B$row"].Value = $item.Value
+            $sysWs.Cells["B$row"].Value = if ($null -eq $item.Value) { "N/A" } else { $item.Value.ToString() }
             $row++
         }
 
@@ -731,9 +794,9 @@ function Export-DiagnosticsReport {
         $row = 1
 
         $netWs.Cells["A$row"].Value = "Network Connectivity Tests"
-        $netWs.Cells["A$row:F$row"].Merge = $true
-        $netWs.Cells["A$row:F$row"].Style.Font.Bold = $true
-        $netWs.Cells["A$row:F$row"].Style.Font.Size = 14
+        $netWs.Cells["A$row:G$row"].Merge = $true
+        $netWs.Cells["A$row:G$row"].Style.Font.Bold = $true
+        $netWs.Cells["A$row:G$row"].Style.Font.Size = 14
         $row++
 
         $netWs.Cells["A$row"].Value = "URL"
@@ -742,7 +805,8 @@ function Export-DiagnosticsReport {
         $netWs.Cells["D$row"].Value = "Description"
         $netWs.Cells["E$row"].Value = "Expected"
         $netWs.Cells["F$row"].Value = "Response Time (ms)"
-        $netWs.Cells["A$row:F$row"].Style.Font.Bold = $true
+        $netWs.Cells["G$row"].Value = "Ping Status"
+        $netWs.Cells["A$row:G$row"].Style.Font.Bold = $true
         $row++
 
         foreach ($item in $NetResults) {
@@ -752,17 +816,19 @@ function Export-DiagnosticsReport {
             $netWs.Cells["D$row"].Value = $item.Description
             $netWs.Cells["E$row"].Value = $item.Expected
             $netWs.Cells["F$row"].Value = $item.ResponseTime
+            $netWs.Cells["G$row"].Value = $item.PingStatus
 
             # Colorize status
-            if ($item.Status -eq "Pass") {
+            switch ($item.Status) {
+                "Pass" { $color = [System.Drawing.Color]::LightGreen }
+                "Fail" { $color = [System.Drawing.Color]::LightCoral }
+                "Error" { $color = [System.Drawing.Color]::LightYellow }
+                default { $color = $null }
+            }
+
+            if ($color) {
                 $netWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
-                $netWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGreen)
-            } elseif ($item.Status -eq "Fail") {
-                $netWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
-                $netWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightCoral)
-            } elseif ($item.Status -eq "Error") {
-                $netWs.Cells["B$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
-                $netWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightYellow)
+                $netWs.Cells["B$row"].Style.Fill.BackgroundColor.SetColor($color)
             }
 
             $row++
@@ -797,15 +863,16 @@ function Export-DiagnosticsReport {
             $svcWs.Cells["E$row"].Value = $item.Account
 
             # Colorize status
-            if ($item.Status -eq "Running") {
+            switch ($item.Status) {
+                "Running" { $color = [System.Drawing.Color]::LightGreen }
+                "Stopped" { $color = [System.Drawing.Color]::LightCoral }
+                "Not Found" { $color = [System.Drawing.Color]::LightGray }
+                default { $color = $null }
+            }
+
+            if ($color) {
                 $svcWs.Cells["C$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
-                $svcWs.Cells["C$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGreen)
-            } elseif ($item.Status -eq "Stopped") {
-                $svcWs.Cells["C$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
-                $svcWs.Cells["C$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightCoral)
-            } elseif ($item.Status -eq "Not Found") {
-                $svcWs.Cells["C$row"].Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
-                $svcWs.Cells["C$row"].Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::LightGray)
+                $svcWs.Cells["C$row"].Style.Fill.BackgroundColor.SetColor($color)
             }
 
             $row++
@@ -813,41 +880,76 @@ function Export-DiagnosticsReport {
 
         $svcWs.Cells.AutoFitColumns()
 
-        # Diagnostics Logs worksheet
+        # CTES Logs worksheet
+        if ($CtesLogs -and $CtesLogs.Count -gt 0) {
+            Write-ProgressHelper -Status "Adding CTES logs" -PercentComplete 80
+            $ctesWs = $excel.Workbook.Worksheets.Add("CTES Logs")
+            $row = 1
+
+            $ctesWs.Cells["A$row"].Value = "CTES Logs"
+            $ctesWs.Cells["A$row:D$row"].Merge = $true
+            $ctesWs.Cells["A$row:D$row"].Style.Font.Bold = $true
+            $ctesWs.Cells["A$row:D$row"].Style.Font.Size = 14
+            $row++
+
+            $ctesWs.Cells["A$row"].Value = "Log File"
+            $ctesWs.Cells["B$row"].Value = "Last Modified"
+            $ctesWs.Cells["C$row"].Value = "Path"
+            $ctesWs.Cells["D$row"].Value = "Content Summary"
+            $ctesWs.Cells["A$row:D$row"].Style.Font.Bold = $true
+            $row++
+
+            foreach ($log in $CtesLogs) {
+                $ctesWs.Cells["A$row"].Value = $log.Name
+                $ctesWs.Cells["B$row"].Value = $log.LastWriteTime
+                $ctesWs.Cells["C$row"].Value = $log.Path
+                # Get first few lines of content as summary
+                $summary = $log.Content -split "`n" | Select-Object -First 5 | Out-String
+                $ctesWs.Cells["D$row"].Value = if ($summary) { $summary.Trim() } else { "N/A" }
+                $row++
+            }
+
+            $ctesWs.Cells.AutoFitColumns()
+        }
+
+        # Diagnostics Logs worksheets
         Write-ProgressHelper -Status "Adding diagnostics logs" -PercentComplete 90
 
         # AbtPS Logs
-        $abtWs = $excel.Workbook.Worksheets.Add("AbtPS Logs")
-        $row = 1
+        if ($AbtPSLog -and $AbtPSLog.Count -gt 0) {
+            $abtWs = $excel.Workbook.Worksheets.Add("AbtPS Logs")
+            $row = 1
 
-        $abtWs.Cells["A$row"].Value
-        $abtWs.Cells["A$row"].Value = "AbtPS Diagnostic Log"
-        $abtWs.Cells["A$row"].Style.Font.Bold = $true
-        $abtWs.Cells["A$row"].Style.Font.Size = 14
-        $row++
-
-        foreach ($line in $AbtPSLog) {
-            $abtWs.Cells["A$row"].Value = $line
+            $abtWs.Cells["A$row"].Value = "AbtPS Diagnostic Log"
+            $abtWs.Cells["A$row"].Style.Font.Bold = $true
+            $abtWs.Cells["A$row"].Style.Font.Size = 14
             $row++
-        }
 
-        $abtWs.Cells.AutoFitColumns()
+            foreach ($line in $AbtPSLog) {
+                $abtWs.Cells["A$row"].Value = $line
+                $row++
+            }
+
+            $abtWs.Cells.AutoFitColumns()
+        }
 
         # DDSNdt Logs
-        $ddsWs = $excel.Workbook.Worksheets.Add("DDSNdt Logs")
-        $row = 1
+        if ($DDSLog -and $DDSLog.Count -gt 0) {
+            $ddsWs = $excel.Workbook.Worksheets.Add("DDSNdt Logs")
+            $row = 1
 
-        $ddsWs.Cells["A$row"].Value = "DDSNdt Network Diagnostic Log"
-        $ddsWs.Cells["A$row"].Style.Font.Bold = $true
-        $ddsWs.Cells["A$row"].Style.Font.Size = 14
-        $row++
-
-        foreach ($line in $DDSLog) {
-            $ddsWs.Cells["A$row"].Value = $line
+            $ddsWs.Cells["A$row"].Value = "DDSNdt Network Diagnostic Log"
+            $ddsWs.Cells["A$row"].Style.Font.Bold = $true
+            $ddsWs.Cells["A$row"].Style.Font.Size = 14
             $row++
-        }
 
-        $ddsWs.Cells.AutoFitColumns()
+            foreach ($line in $DDSLog) {
+                $ddsWs.Cells["A$row"].Value = $line
+                $row++
+            }
+
+            $ddsWs.Cells.AutoFitColumns()
+        }
 
         # Save the Excel report
         $excel.SaveAs($ExcelPath)
@@ -860,4 +962,153 @@ function Export-DiagnosticsReport {
         Write-Warning "Failed to create Excel report: $_"
         return $false
     }
+    finally {
+        if ($excel) {
+            $excel.Dispose()
+        }
+    }
+}
+
+function Get-CtesLogs {
+    param (
+        [string]$LogPath = "C:\ProgramData\CTES\logs"
+    )
+
+    try {
+        if (-not (Test-Path $LogPath)) {
+            Write-Verbose "CTES logs path not found: $LogPath"
+            return @()
+        }
+
+        $logs = Get-ChildItem -Path $LogPath -File -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    Name = $_.Name
+                    Path = $_.FullName
+                    Content = Get-Content -Path $_.FullName -Raw -ErrorAction SilentlyContinue
+                    LastWriteTime = $_.LastWriteTime
+                }
+            }
+
+        return $logs
+    }
+    catch {
+        Write-Warning "Failed to collect CTES logs: $_"
+        return @()
+    }
+}
+
+# Main script execution block
+try {
+    # Initialize diagnostics folder
+    $diagFolder = New-DiagnosticsFolder
+
+    # Check for required modules if Excel output is requested
+    $hasExcelModule = $false
+    if ($IncludeExcel) {
+        $hasExcelModule = Test-RequiredModule
+        if (-not $hasExcelModule) {
+            Write-Warning "Excel output requested but ImportExcel module not available. Excel report will be skipped."
+        }
+    }
+
+    # Collect system information
+    $sysInfoResults = Get-SystemInfo
+
+    # Check Absolute services
+    $serviceResults = Test-Services
+
+    # Test network connectivity
+    $networkResults = Test-NetworkEndpoints -Endpoints $EndpointsToCheck -Expected $ExpectedStatusCodes -Timeout $NetworkTimeout
+
+    # Run AbtPS diagnostics if available
+    $abtPSResults = @()
+    $abtPSPath = Join-Path $PSScriptRoot "AbtPS.exe"
+    if (Test-Path $abtPSPath) {
+        $abtPSResults = Invoke-AbtPSDiagnostics -AbtPSPath $abtPSPath -TimeoutSec $CallTimeoutSec -LogPath (Join-Path $diagFolder "AbtPS.log")
+    } else {
+        Write-Warning "AbtPS.exe not found in script directory. Skipping AbtPS diagnostics."
+    }
+
+    # Run network diagnostics if available
+    $ddsResults = @()
+    $ddsPath = Join-Path $PSScriptRoot "DDSNdt.exe"
+    if (Test-Path $ddsPath) {
+        $ddsResults = Invoke-NetworkDiagnostics -DDSNdtPath $ddsPath -LogDir $diagFolder
+    } else {
+        Write-Warning "DDSNdt.exe not found in script directory. Skipping network diagnostics."
+    }
+
+    # Collect CTES logs
+    $ctesLogs = Get-CtesLogs -LogPath "C:\ProgramData\CTES\logs"
+    if ($ctesLogs.Count -gt 0) {
+        $ctesLogPath = Join-Path $diagFolder "CTES_Logs"
+        if (!(Test-Path $ctesLogPath)) {
+            New-Item -ItemType Directory -Path $ctesLogPath -Force | Out-Null
+        }
+        foreach ($log in $ctesLogs) {
+            $destPath = Join-Path $ctesLogPath $log.Name
+            Copy-Item -Path $log.Path -Destination $destPath -Force
+        }
+        Write-Verbose "CTES logs copied to: $ctesLogPath"
+    } else {
+        Write-Verbose "No CTES logs found at the specified path."
+    }
+
+    # Create HTML report (default)
+    $htmlPath = Join-Path $diagFolder "DiagnosticsReport.html"
+    $htmlResult = Export-HtmlReport -HtmlPath $htmlPath `
+        -SystemInfo $sysInfoResults `
+        -ExtendedInfo $ExtendedInfo `
+        -AbtPSLog $abtPSResults `
+        -NetResults $networkResults `
+        -DDSLog $ddsResults `
+        -ServiceStatus $serviceResults `
+        -CtesLogs $ctesLogs
+
+    if ($htmlResult) {
+        Write-Verbose "HTML report created at: $htmlPath"
+    }
+
+    # Create Excel report if requested and module available
+    if ($IncludeExcel -and $hasExcelModule) {
+        $excelPath = Join-Path $diagFolder "DiagnosticsReport.xlsx"
+        $excelResult = Export-DiagnosticsReport -ExcelPath $excelPath `
+            -SystemInfo $sysInfoResults `
+            -ExtendedInfo $ExtendedInfo `
+            -AbtPSLog $abtPSResults `
+            -NetResults $networkResults `
+            -DDSLog $ddsResults `
+            -ServiceStatus $serviceResults `
+            -CtesLogs $ctesLogs
+
+        if ($excelResult) {
+            Write-Verbose "Excel report created at: $excelPath"
+        }
+    }
+
+    # Create ZIP archive if requested
+    if (-not $SkipZip) {
+        $zipPath = "$diagFolder.zip"
+        Write-Verbose "Creating ZIP archive at: $zipPath"
+        Compress-Archive -Path $diagFolder -DestinationPath $zipPath -Force
+        Write-Verbose "ZIP archive created successfully"
+    }
+
+    Write-Host "`nDiagnostics completed successfully. Reports can be found in: $diagFolder"
+    Write-Host "HTML report: $htmlPath"
+    if ($IncludeExcel -and $hasExcelModule -and $excelResult) {
+        Write-Host "Excel report: $excelPath"
+    }
+    if (-not $SkipZip) {
+        Write-Host "ZIP archive: $zipPath"
+    }
+}
+catch {
+    Write-Error "An error occurred while running diagnostics: $_"
+    throw
+}
+finally {
+    Stop-Transcript
+    Write-Progress -Id $script:ProgressId -Activity $script:ProgressActivity -Completed
 }
