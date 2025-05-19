@@ -6,8 +6,8 @@ Absolute Agent Diagnostic Collector
 Runs Absolute agent diagnostics: system info, endpoints, CTES logs, AbtPS/DDSNdt, HTML/Excel output.
 
 .EXAMPLE
-.\CheckNdtRpcnet.ps1
-.\CheckNdtRpcnet.ps1 -GenerateExcel
+.\CheckNdtRpcnet_v3.ps1
+.\CheckNdtRpcnet_v3.ps1 -GenerateExcel
 #>
 
 [CmdletBinding()]
@@ -98,7 +98,7 @@ function Invoke-DDSNdtDiagnostics {
         return $log
     }
     try {
-        $output = & $DDSPath 2>&1
+        $output = & $DDSPath /server=resources.namequery.com 2>&1
         $log.AddRange($output)
     } catch {
         $log.Add("Error running DDSNdt: $($_.Exception.Message)")

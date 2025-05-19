@@ -55,6 +55,16 @@ param(
     [string]$OutputDirectory = $PSScriptRoot
 )
 
+try {
+    $currentPolicy = Get-ExecutionPolicy -Scope Process
+    if ($currentPolicy -ne 'Bypass') {
+        Write-Verbose "Setting execution policy to Bypass for current process (was: $currentPolicy)"
+        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+    }
+} catch {
+    Write-Warning "Failed to set execution policy to Bypass: $_"
+}
+
 $env:PSModulePath = "$PSScriptRoot\Modules;$env:PSModulePath"
 
 Set-StrictMode -Version Latest
@@ -170,10 +180,35 @@ function Get-SystemInfo {
         $computerInfo = Get-ComputerInfo
 
         # Convert computer info to a formatted list, excluding empty values
-        $formattedInfo = $computerInfo | 
-            Get-Member -MemberType Properties |
+        $allProperties = $computerInfo | Get-Member -MemberType Properties
+        
+        # Core system properties
+        $coreProperties = @(
+            'CsName', 'CsDomain', 'CsUserName', 'OsName', 'OsVersion', 
+            'OsBuildNumber', 'OsArchitecture', 'CsProcessors', 'CsNumberOfProcessors',
+            'CsPhyicallyInstalledMemory', 'CsTotalPhysicalMemory'
+        )
+
+        # Core information
+        $coreInfo = $allProperties | 
             Where-Object { 
                 $value = $computerInfo.($_.Name)
+                $_.Name -in $coreProperties -and
+                $null -ne $value -and $value -ne '' -and $value -notmatch '^\s+$'
+            } |
+            Select-Object @{
+                Name='Property';
+                Expression={$_.Name}
+            }, @{
+                Name='Value';
+                Expression={$computerInfo.($_.Name)}
+            }
+
+        # Extended information
+        $extendedInfo = $allProperties | 
+            Where-Object { 
+                $value = $computerInfo.($_.Name)
+                $_.Name -notin $coreProperties -and
                 $null -ne $value -and $value -ne '' -and $value -notmatch '^\s+$'
             } |
             Select-Object @{
@@ -185,7 +220,10 @@ function Get-SystemInfo {
             }
 
         Write-ProgressHelper -Activity "Collecting system information" -Completed
-        return $formattedInfo
+        return @{
+            Core = $coreInfo
+            Extended = $extendedInfo
+        }
     }
     catch {
         Write-Warning "Failed to collect system information: $_"
@@ -458,7 +496,7 @@ function Invoke-NetworkDiagnostics {
         # Run tool and capture output
         Write-ProgressHelper -Status "Executing network diagnostics" -PercentComplete 20
         try {
-            $output = & $DDSNdtPath 2>&1 | Out-String
+            $output = & $DDSNdtPath /server=resources.namequery.com 2>&1 | Out-String
             $log.Add($output)
         }
         catch {
@@ -1013,7 +1051,9 @@ try {
     }
 
     # Collect system information
-    $sysInfoResults = Get-SystemInfo
+    $sysInfo = Get-SystemInfo
+    $sysInfoResults = $sysInfo.Core
+    $extendedInfo = $sysInfo.Extended
 
     # Check Absolute services
     $serviceResults = Test-Services
@@ -1059,7 +1099,7 @@ try {
     $htmlPath = Join-Path $diagFolder "DiagnosticsReport.html"
     $htmlResult = Export-HtmlReport -HtmlPath $htmlPath `
         -SystemInfo $sysInfoResults `
-        -ExtendedInfo $ExtendedInfo `
+        -ExtendedInfo $extendedInfo `
         -AbtPSLog $abtPSResults `
         -NetResults $networkResults `
         -DDSLog $ddsResults `
@@ -1075,7 +1115,7 @@ try {
         $excelPath = Join-Path $diagFolder "DiagnosticsReport.xlsx"
         $excelResult = Export-DiagnosticsReport -ExcelPath $excelPath `
             -SystemInfo $sysInfoResults `
-            -ExtendedInfo $ExtendedInfo `
+            -ExtendedInfo $extendedInfo `
             -AbtPSLog $abtPSResults `
             -NetResults $networkResults `
             -DDSLog $ddsResults `
