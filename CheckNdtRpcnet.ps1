@@ -39,19 +39,19 @@ param(
     [switch]$VerboseLog,
     [int]$NetworkTimeout = 10,
     [string[]]$EndpointsToCheck = @(
-        "http://search.namequery.com",
-        "https://search.namequery.com/ctes/1.0.0/configuration",
-        "https://search.namequery.com/downloads/public/bin/Windows/CTES/CTES/1.0.0.3316/filelist.txt",
-        "https://deviceapi.ca1.absolute.com/ctes/1.0.0/configuration",
-        "https://resources.namequery.com/downloads/public/bin/Windows/CTES/HDC/2.0.15.13/CtHWiPrvPackage.zip"
-    ),
-    [hashtable]$ExpectedStatusCodes = @{
-        "http://search.namequery.com" = "301 or 200";
-        "https://search.namequery.com/ctes/1.0.0/configuration" = "401";
-        "https://search.namequery.com/downloads/public/bin/Windows/CTES/CTES/1.0.0.3316/filelist.txt" = "200";
-        "https://deviceapi.ca1.absolute.com/ctes/1.0.0/configuration" = "401";
-        "https://resources.namequery.com/downloads/public/bin/Windows/CTES/HDC/2.0.15.13/CtHWiPrvPackage.zip" = "404 or 200"
-    },
+    "http://search.namequery.com",
+    "https://search.namequery.com/ctes/1.0.0/configuration", 
+    "https://search.namequery.com/downloads/public/bin/Windows/CTES/CTES/1.0.0.3316/filelist.txt",
+    "https://deviceapi.ca1.absolute.com/ctes/1.0.0/configuration",
+    "https://resources.namequery.com/downloads/public/bin/Windows/CTES/HDC/2.0.15.13/CtHWiPrvPackage.zip"
+),
+[hashtable]$ExpectedStatusCodes = @{
+    "http://search.namequery.com" = "200";  # Updated to match curl behavior
+    "https://search.namequery.com/ctes/1.0.0/configuration" = "401";
+    "https://search.namequery.com/downloads/public/bin/Windows/CTES/CTES/1.0.0.3316/filelist.txt" = "200";
+    "https://deviceapi.ca1.absolute.com/ctes/1.0.0/configuration" = "401";
+    "https://resources.namequery.com/downloads/public/bin/Windows/CTES/HDC/2.0.15.13/CtHWiPrvPackage.zip" = "404 or 200"
+},
     [string]$OutputDirectory = $PSScriptRoot
 )
 
@@ -387,70 +387,43 @@ function Test-NetworkEndpoints {
 
     try {
         $results = @()
-
-        for ($i = 0; $i -lt $Endpoints.Count; $i++) {
-            $endpoint = $Endpoints[$i]
-            $percentComplete = [math]::Min(($i / $Endpoints.Count) * 100, 100)
-
-            Write-ProgressHelper -Status "Testing $endpoint" -PercentComplete $percentComplete
-
-            # Get connectivity info
-            $connectivity = Test-NetworkConnectivity -Endpoint $endpoint -Timeout $Timeout
-
+        
+        foreach ($endpoint in $Endpoints) {
+            Write-ProgressHelper -Status "Testing $endpoint"
+            
             try {
-                $startTime = Get-Date
-                $response = Invoke-WebRequest -Uri $endpoint -TimeoutSec $Timeout -UseBasicParsing -ErrorAction Stop
-                $responseTime = ((Get-Date) - $startTime).TotalMilliseconds
+                $request = [System.Net.WebRequest]::Create($endpoint)
+                $request.Method = "GET"
+                $request.Timeout = $Timeout * 1000
+                $request.AllowAutoRedirect = $false # Match curl behavior for redirects
+                
+                try {
+                    $response = $request.GetResponse()
+                    $statusCode = [int]$response.StatusCode
+                    $statusDesc = $response.StatusDescription
+                }
+                catch [System.Net.WebException] {
+                    if ($_.Exception.Response) {
+                        $statusCode = [int]$_.Exception.Response.StatusCode
+                        $statusDesc = $_.Exception.Response.StatusDescription
+                    }
+                    else {
+                        throw
+                    }
+                }
+                finally {
+                    if ($response) { $response.Dispose() }
+                }
 
-                $statusDesc = [int]$response.StatusCode
                 $expectedStatus = if ($Expected.ContainsKey($endpoint)) { $Expected[$endpoint] } else { "200" }
-
-                # Check if actual status matches expected (handles "301 or 200" style expectations)
-                $statusMatch = $expectedStatus -split ' or ' | ForEach-Object { $_ -eq $statusDesc.ToString() } | Where-Object { $_ -eq $true } | Select-Object -First 1
+                $statusMatch = $expectedStatus -split ' or ' | Where-Object { $_ -eq $statusCode.ToString() } | Select-Object -First 1
 
                 $results += [PSCustomObject]@{
                     URL = $endpoint
                     Status = if ($statusMatch) { "Pass" } else { "Fail" }
-                    Code = $statusDesc
-                    Description = $response.StatusDescription
+                    Code = $statusCode
+                    Description = $statusDesc
                     Expected = $expectedStatus
-                    ResponseTime = [math]::Round($responseTime)
-                    PingStatus = if ($connectivity.PingSuccessful) { "Success" } else { "Failed" }
-                    TraceRoute = if ($connectivity.TraceRoute) { $connectivity.TraceRoute -join " -> " } else { "N/A" }
-                }
-            }
-            catch [System.Net.WebException] {
-                $webEx = $_.Exception
-
-                if ($null -ne $webEx.Response) {
-                    $statusCode = [int]$webEx.Response.StatusCode
-                    $statusDesc = $webEx.Response.StatusDescription
-
-                    $expectedStatus = if ($Expected.ContainsKey($endpoint)) { $Expected[$endpoint] } else { "200" }
-                    $statusMatch = $expectedStatus -split ' or ' | ForEach-Object { $_ -eq $statusCode.ToString() } | Where-Object { $_ -eq $true } | Select-Object -First 1
-
-                    $results += [PSCustomObject]@{
-                        URL = $endpoint
-                        Status = if ($statusMatch) { "Pass" } else { "Fail" }
-                        Code = $statusCode
-                        Description = $statusDesc
-                        Expected = $expectedStatus
-                        ResponseTime = 0
-                        PingStatus = if ($connectivity.PingSuccessful) { "Success" } else { "Failed" }
-                        TraceRoute = if ($connectivity.TraceRoute) { $connectivity.TraceRoute -join " -> " } else { "N/A" }
-                    }
-                }
-                else {
-                    $results += [PSCustomObject]@{
-                        URL = $endpoint
-                        Status = "Error"
-                        Code = 0
-                        Description = $webEx.Message
-                        Expected = if ($Expected.ContainsKey($endpoint)) { $Expected[$endpoint] } else { "200" }
-                        ResponseTime = 0
-                        PingStatus = if ($connectivity.PingSuccessful) { "Success" } else { "Failed" }
-                        TraceRoute = if ($connectivity.TraceRoute) { $connectivity.TraceRoute -join " -> " } else { "N/A" }
-                    }
                 }
             }
             catch {
@@ -460,9 +433,6 @@ function Test-NetworkEndpoints {
                     Code = 0
                     Description = $_.Exception.Message
                     Expected = if ($Expected.ContainsKey($endpoint)) { $Expected[$endpoint] } else { "200" }
-                    ResponseTime = 0
-                    PingStatus = if ($connectivity.PingSuccessful) { "Success" } else { "Failed" }
-                    TraceRoute = if ($connectivity.TraceRoute) { $connectivity.TraceRoute -join " -> " } else { "N/A" }
                 }
             }
         }
