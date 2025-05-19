@@ -38,9 +38,6 @@ param(
     [switch]$SkipZip,
     [switch]$VerboseLog,
     [int]$NetworkTimeout = 10,
-    [switch]$DisableCertValidation,
-    [int]$PingTimeout = 5,
-    [int]$TraceRouteTimeout = 15,
     [string[]]$EndpointsToCheck = @(
     "http://search.namequery.com",
     "https://search.namequery.com/ctes/1.0.0/configuration", 
@@ -58,25 +55,8 @@ param(
     [string]$OutputDirectory = $PSScriptRoot
 )
 
-# Configure TLS and certificate validation
+# Enable TLS 1.2 and 1.3 for all HTTPS requests
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-
-if ($DisableCertValidation) {
-    Write-Verbose "Certificate validation disabled for this session"
-    if (-not ("dummy" -as [type])) {
-        Add-Type -TypeDefinition @"
-            using System.Net;
-            using System.Security.Cryptography.X509Certificates;
-            public static class Dummy {
-                public static bool ReturnTrue(object sender,
-                    X509Certificate certificate,
-                    X509Chain chain,
-                    SslPolicyErrors sslPolicyErrors) { return true; }
-            }
-"@
-    }
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [dummy]::ReturnTrue
-}
 
 try {
     $currentPolicy = Get-ExecutionPolicy -Scope Process
@@ -117,7 +97,7 @@ function Write-ProgressHelper {
     [CmdletBinding()]
     param(
         [string]$Activity,
-        [string]$Status,
+        [string]$Status = "",
         [int]$PercentComplete = -1,
         [switch]$Completed
     )
@@ -130,11 +110,13 @@ function Write-ProgressHelper {
     else {
         if ($PercentComplete -ge 0) {
             $totalPercent = [math]::Min((($script:CurrentStep / $script:TotalSteps) * 100) + (($PercentComplete / 100) * (100 / $script:TotalSteps)), 100)
-            Write-Progress -Id $script:ProgressId -Activity $script:ProgressActivity -Status $Status -PercentComplete $totalPercent
+            $statusMsg = if ([string]::IsNullOrWhiteSpace($Status)) { "Processing..." } else { $Status }
+            Write-Progress -Id $script:ProgressId -Activity $script:ProgressActivity -Status $statusMsg -PercentComplete $totalPercent
         }
         else {
             $percent = [math]::Min(($script:CurrentStep / $script:TotalSteps) * 100, 100)
-            Write-Progress -Id $script:ProgressId -Activity $script:ProgressActivity -Status $Activity -PercentComplete $percent
+            $statusMsg = if ([string]::IsNullOrWhiteSpace($Status) -and ![string]::IsNullOrWhiteSpace($Activity)) { $Activity } else { "Processing..." }
+            Write-Progress -Id $script:ProgressId -Activity $script:ProgressActivity -Status $statusMsg -PercentComplete $percent
         }
     }
 }
@@ -371,8 +353,7 @@ function Invoke-AbtPSDiagnostics {
 function Test-NetworkConnectivity {
     param (
         [string]$Endpoint,
-        [int]$PingTimeout = 5,
-        [int]$TraceRouteTimeout = 15
+        [int]$Timeout = 5
     )
 
     try {
@@ -380,22 +361,14 @@ function Test-NetworkConnectivity {
         $uri = [System.Uri]$Endpoint
         $hostname = $uri.Host
 
-        # Create ping options with timeout
-        $pingOptions = New-Object System.Net.NetworkInformation.PingOptions
-        $pingOptions.DontFragment = $true
+        # Run ping test
+        $pingResult = Test-Connection -ComputerName $hostname -Count 2 -Quiet
 
-        # Run ping test with timeout
-        $ping = New-Object System.Net.NetworkInformation.Ping
-        $pingResult = $ping.Send($hostname, $PingTimeout * 1000)
-        $pingSuccess = $pingResult.Status -eq 'Success'
-
-        # Run traceroute with timeout
+        # Run traceroute (limited to 15 hops for performance)
         $traceOutput = @()
         try {
             $traceRoute = Test-NetConnection -ComputerName $hostname -TraceRoute -Hops 15 -WarningAction SilentlyContinue
-            if ($traceRoute.TraceRoute) {
-                $traceOutput = $traceRoute.TraceRoute
-            }
+            $traceOutput = $traceRoute.TraceRoute
         }
         catch {
             $traceOutput = @("Traceroute failed: $($_.Exception.Message)")
@@ -403,8 +376,7 @@ function Test-NetworkConnectivity {
 
         return @{
             Host = $hostname
-            PingSuccessful = $pingSuccess
-            PingTime = if ($pingSuccess) { $pingResult.RoundtripTime } else { 0 }
+            PingSuccessful = $pingResult
             TraceRoute = $traceOutput
         }
     }
@@ -412,7 +384,6 @@ function Test-NetworkConnectivity {
         return @{
             Host = "Unknown"
             PingSuccessful = $false
-            PingTime = 0
             TraceRoute = @("Error: $($_.Exception.Message)")
         }
     }
@@ -431,7 +402,7 @@ function Test-NetworkEndpoints {
         $results = @()
         
         foreach ($endpoint in $Endpoints) {
-            Write-ProgressHelper -Status "Testing $endpoint"
+            Write-ProgressHelper -Activity "Testing network connectivity" -Status "Testing $endpoint"
             
             try {
                 # Get ping and traceroute results first
@@ -504,7 +475,7 @@ function Test-NetworkEndpoints {
             }
         }
 
-        Write-ProgressHelper -Activity "Testing network connectivity" -Completed
+        Write-ProgressHelper -Activity "Testing network connectivity" -Status "Completed endpoint testing" -Completed
         return $results
     }
     catch {
@@ -828,12 +799,11 @@ function Export-DiagnosticsReport {
 
         Write-ProgressHelper -Status "Creating Excel workbook" -PercentComplete 20
 
-        try {
-            # Create Excel package
-            $excel = New-Object OfficeOpenXml.ExcelPackage $ExcelPath
+        # Create Excel package
+        $excel = New-Object OfficeOpenXml.ExcelPackage
 
-            # System Info worksheet
-            Write-ProgressHelper -Status "Adding system information" -PercentComplete 30
+        # System Info worksheet
+        Write-ProgressHelper -Status "Adding system information" -PercentComplete 30
         $sysWs = $excel.Workbook.Worksheets.Add("System Info")
         $row = 1
 
