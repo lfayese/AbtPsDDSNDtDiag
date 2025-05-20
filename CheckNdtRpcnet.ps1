@@ -63,7 +63,7 @@ param(
 Add-Type -AssemblyName System.Web
 
 # Set execution policy before use
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+Set-ExecutionPolicy Bypass -Scope LocalMachine -Force
 
 $env:PSModulePath = "$PSScriptRoot\Modules;$env:PSModulePath"
 
