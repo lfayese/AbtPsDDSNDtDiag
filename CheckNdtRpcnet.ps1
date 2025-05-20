@@ -62,20 +62,8 @@ param(
 # Load HtmlEncode support
 Add-Type -AssemblyName System.Web
 
-# Define execution policy helper before use
-function Set-ProcessExecutionPolicy {
-    try {
-        if ((Get-ExecutionPolicy -Scope Process) -ne 'Bypass') {
-            Write-Verbose "Setting execution policy to Bypass for current process (was: $(Get-ExecutionPolicy -Scope Process))"
-            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-        }
-    } catch {
-        Write-Warning "Unable to set execution policy: $_"
-    }
-}
-
-# Set the execution policy
-Set-ProcessExecutionPolicy
+# Set execution policy before use
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 
 $env:PSModulePath = "$PSScriptRoot\Modules;$env:PSModulePath"
 
